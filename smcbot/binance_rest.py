@@ -17,14 +17,24 @@ _MAX_PER_CALL = 1500
 
 
 class BinanceREST:
-    def __init__(self, base: str | None = None, timeout: float = 15.0):
+    def __init__(self, base: str | None = None, timeout: float = 30.0):
         self._http = httpx.Client(base_url=base or SETTINGS.binance_base, timeout=timeout)
 
-    def _get(self, path: str, params: dict | None = None, retries: int = 3):
+    def _get(self, path: str, params: dict | None = None, retries: int = 6):
+        """GET dengan backoff. 429 = lewat batas bobot per menit: tunggu sesuai Retry-After (atau naik
+        bertahap sampai 60 dtk). 418 = IP diblokir sementara: berhenti, jangan menekan lagi."""
         for attempt in range(retries):
-            r = self._http.get(path, params=params)
-            if r.status_code in (418, 429):
-                time.sleep(2 ** attempt)
+            try:
+                r = self._http.get(path, params=params)
+            except httpx.TransportError:  # timeout/putus sesaat: ulangi dengan jeda, jangan gugurkan seluruh unduhan
+                if attempt == retries - 1:
+                    raise
+                time.sleep(2 * 2 ** attempt)
+                continue
+            if r.status_code == 418:
+                raise RuntimeError(f"Binance memblokir IP sementara (418) di {path}; Retry-After={r.headers.get('retry-after')}")
+            if r.status_code == 429:
+                time.sleep(min(float(r.headers.get("retry-after", 0)) or 5 * 2 ** attempt, 60))
                 continue
             r.raise_for_status()
             return r.json()
@@ -58,6 +68,7 @@ class BinanceREST:
         frames, cursor = [], start_ms
         while cursor < end_ms:
             df = self.klines(symbol, interval, _MAX_PER_CALL, start_ms=cursor, end_ms=end_ms)
+            time.sleep(0.5)  # halaman 1500 candle berbobot 10; <= ~120 panggilan/menit = aman di bawah 2400/menit
             if df.empty:
                 break
             frames.append(df)

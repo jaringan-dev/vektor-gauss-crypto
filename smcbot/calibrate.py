@@ -3,12 +3,15 @@ dengan split waktu (latih = paruh awal, uji = paruh akhir, disentuh sekali).
 
   python -m smcbot.calibrate scan --days 180 --pairs 20     # lambat, hasil ke data/candidates.csv
   python -m smcbot.calibrate analyze                        # cepat, bisa diulang
+  python -m smcbot.calibrate scan --offset-days 180         # hold-out: 180 hari SEBELUM periode kalibrasi
+  python -m smcbot.calibrate holdout                        # vonis tunggal, aturan dibekukan
 """
 from __future__ import annotations
 
 import argparse
+import subprocess
+import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -19,17 +22,22 @@ from .config import SETTINGS, Settings
 from .scorer import gather_candidate
 
 CSV = DATA_DIR / "candidates.csv"
+CSV_HOLD = DATA_DIR / "candidates_holdout.csv"
+
+#: ATURAN DIBEKUKAN dari kalibrasi 2026-10-16 (dipilih dari data latih saja). Jangan diubah untuk hold-out.
+FROZEN_THRESHOLD = 37.0
 
 
 # --------------------------------------------------------------------------
 # Scan
 # --------------------------------------------------------------------------
 def scan_symbol(args) -> list[dict]:
-    symbol, l, h1, h4, start_i, s = args
+    symbol, l, h1, h4, start_i, s, *rest = args
+    end_i = rest[0] if rest else len(l)
     mask = candidate_mask(l)
     h1c, h4c = h1["close_time"].to_numpy(), h4["close_time"].to_numpy()
     rows = []
-    for i in range(max(start_i, s.scan_window), len(l)):
+    for i in range(max(start_i, s.scan_window), min(end_i, len(l))):
         if not mask[i]:
             continue
         w = l.iloc[i - s.scan_window + 1 : i + 1].reset_index(drop=True)
@@ -51,25 +59,67 @@ def scan_symbol(args) -> list[dict]:
     return rows
 
 
-def run_scan(days: int, pairs: int, workers: int) -> None:
+def _prefix(offset: int) -> str:
+    return "cand" if offset == 0 else "hold"
+
+
+def scan_one(symbol: str, days: int, offset: int = 0) -> None:
+    """Pindai satu pair pada jendela [-(offset+days), -offset] hari dan tulis data/<prefix>_<SYMBOL>.csv."""
     s, rest = SETTINGS, BinanceREST()
-    symbols = rest.top_symbols(pairs, s.min_quote_volume_usd)
-    jobs = []
-    for sym in symbols:
-        l = load_history(rest, sym, "15m", days + 5)
-        h1 = load_history(rest, sym, "1h", days + 15)
-        h4 = load_history(rest, sym, "4h", days + 45)
-        if len(l) < s.scan_window + 500:
-            continue
-        st = int(np.searchsorted(l["close_time"].to_numpy(), l["close_time"].iloc[-1] - days * 86_400_000))
-        jobs.append((sym, l, h1, h4, st, s))
-    t0 = time.time()
-    with ProcessPoolExecutor(max_workers=workers) as ex:
-        out = [r for rows in ex.map(scan_symbol, jobs) for r in rows]
-    df = pd.DataFrame(out).sort_values("time").reset_index(drop=True)
+    total = offset + days
+    l = load_history(rest, symbol, "15m", total + 5)
+    h1 = load_history(rest, symbol, "1h", total + 15)
+    h4 = load_history(rest, symbol, "4h", total + 45)
+    ct, last = l["close_time"].to_numpy(), int(l["close_time"].iloc[-1])
+    end_ts = last - offset * 86_400_000
+    st = int(np.searchsorted(ct, end_ts - days * 86_400_000))
+    en = int(np.searchsorted(ct, end_ts))
+    rows = scan_symbol((symbol, l, h1, h4, st, s, en))
     DATA_DIR.mkdir(exist_ok=True)
-    df.to_csv(CSV, index=False)
-    print(f"{len(jobs)} pair, {len(df)} kandidat (lolos gerbang + rencana valid), {time.time() - t0:.0f} detik -> {CSV}")
+    pd.DataFrame(rows).to_csv(DATA_DIR / f"{_prefix(offset)}_{symbol}.csv", index=False)
+
+
+def run_scan(days: int, pairs: int, workers: int, offset: int = 0) -> None:
+    """Subproses terpisah per pair (bukan ProcessPoolExecutor: pool pecah dengan WinError 6 di Windows
+    saat berjalan di latar belakang). stdin ditutup agar tidak mewarisi handle yang tidak valid."""
+    s, rest = SETTINGS, BinanceREST()
+    pre, out_csv = _prefix(offset), (CSV if offset == 0 else CSV_HOLD)
+    if offset == 0:
+        symbols = rest.top_symbols(pairs, s.min_quote_volume_usd)
+    else:  # hold-out: daftar pair DIBEKUKAN dari kalibrasi, bukan top volume baru
+        symbols = list(pd.read_csv(CSV)["symbol"].unique())
+    DATA_DIR.mkdir(exist_ok=True)
+    for sym in symbols:  # unduh/cek cache di proses induk agar subproses hanya membaca
+        for tf, extra in (("15m", 5), ("1h", 15), ("4h", 45)):
+            load_history(rest, sym, tf, offset + days + extra)
+    t0 = time.time()
+    pending, running, done, failed = list(symbols), {}, 0, []
+    while pending or running:
+        while pending and len(running) < workers:
+            sym = pending.pop(0)
+            (DATA_DIR / f"{pre}_{sym}.csv").unlink(missing_ok=True)
+            running[sym] = subprocess.Popen(
+                [sys.executable, "-m", "smcbot.calibrate", "scan-one", sym, "--days", str(days), "--offset-days", str(offset)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        time.sleep(2)
+        for sym, proc in list(running.items()):
+            if proc.poll() is None:
+                continue
+            del running[sym]
+            done += 1
+            f = DATA_DIR / f"{pre}_{sym}.csv"
+            ok = proc.returncode == 0 and f.exists()
+            if not ok:
+                failed.append(sym)
+            n = len(pd.read_csv(f)) if ok and f.stat().st_size > 5 else 0
+            print(f"[{done}/{len(symbols)}] {sym}: {'GAGAL' if not ok else str(n) + ' kandidat'} ({time.time() - t0:.0f} detik)", flush=True)
+    frames = [pd.read_csv(DATA_DIR / f"{pre}_{x}.csv", parse_dates=["time", "exit_time"])
+              for x in symbols if x not in failed and (DATA_DIR / f"{pre}_{x}.csv").stat().st_size > 5]
+    df = pd.concat(frames, ignore_index=True).sort_values("time").reset_index(drop=True)
+    df.to_csv(out_csv, index=False)
+    print(f"{len(symbols) - len(failed)}/{len(symbols)} pair, {len(df)} kandidat, {time.time() - t0:.0f} detik -> {out_csv}"
+          + (f" | GAGAL: {failed}" if failed else ""))
 
 
 # --------------------------------------------------------------------------
@@ -146,8 +196,88 @@ def analyze(min_train: int = 40) -> None:
     print("  latih :", _m(tr[tr["score"] >= th]))
     print("  UJI   :", _m(te[te["score"] >= th]))
     print("  UJI semua (tanpa ambang):", _m(te))
+    verdict(tr, te, th, n_pairs=df["symbol"].nunique())
     print("\nCatatan: tiap analisis di atas adalah perbandingan ganda pada sampel kecil; hanya hasil UJI yang punya arti,")
     print("dan hanya jika CI 95%-nya tidak mencakup nol DAN lebih baik dari baseline.")
+
+
+#: Kriteria sesuai tujuan aplikasi, DITETAPKAN SEBELUM hasil kalibrasi dilihat (2026-10-15).
+#: Tujuan: sinyal Long berprobabilitas tinggi, 1-5 per hari, eksekusi manual, risiko $5.
+GOAL = {
+    "win_margin": 0.05,         # win rate harus >= titik impas + 5 poin persen
+    "min_signals_per_day": 1.0,  # diproyeksikan ke 75 pair
+    "max_signals_per_day": 5.0,
+    "min_test_trades": 30,      # di bawah ini tidak ada kesimpulan
+}
+
+
+def verdict(tr: pd.DataFrame, te: pd.DataFrame, th: float, n_pairs: int, universe: int = 75) -> None:
+    """Vonis terhadap tujuan aplikasi, pada data UJI dengan ambang yang dipilih dari LATIH."""
+    sel = te[te["score"] >= th].sort_values("time")
+    print("\n== 6. VONIS terhadap tujuan aplikasi (data UJI, ambang dari LATIH) ==")
+    if len(sel) < GOAL["min_test_trades"]:
+        print(f"  TIDAK ADA KESIMPULAN: hanya {len(sel)} trade uji (< {GOAL['min_test_trades']}).")
+        return
+    m = metrics(sel["r"].to_numpy())
+    win_r = sel.loc[sel["r"] > 0, "r"].mean()
+    loss_r = -sel.loc[sel["r"] <= 0, "r"].mean()
+    breakeven = loss_r / (win_r + loss_r) if win_r + loss_r > 0 else float("nan")
+    days = max((sel["time"].max() - sel["time"].min()).days, 1)
+    per_day = len(sel) / days * universe / n_pairs
+    halves = [sel.iloc[: len(sel) // 2], sel.iloc[len(sel) // 2 :]]
+    checks = {
+        f"win rate {m['win_rate']:.1%} >= impas {breakeven:.1%} + {GOAL['win_margin']:.0%}":
+            m["win_rate"] >= breakeven + GOAL["win_margin"],
+        f"rata-rata R {m['avg_r']:+.3f} > 0": m["avg_r"] > 0,
+        f"positif di kedua paruh uji ({halves[0]['r'].mean():+.2f} / {halves[1]['r'].mean():+.2f})":
+            all(h["r"].mean() > 0 for h in halves),
+        f"frekuensi ~{per_day:.1f}/hari (proyeksi {universe} pair) dalam {GOAL['min_signals_per_day']:.0f}-{GOAL['max_signals_per_day']:.0f}":
+            GOAL["min_signals_per_day"] <= per_day <= GOAL["max_signals_per_day"],
+    }
+    for text, ok in checks.items():
+        print(f"  [{'OK' if ok else 'GAGAL'}] {text}")
+    proven = m["ci95"][0] > 0
+    print(f"  [{'OK' if proven else 'BELUM'}] CI 95% rata-rata R: {m['ci95'][0]:+.2f}..{m['ci95'][1]:+.2f} "
+          f"({'tidak mencakup nol' if proven else 'mencakup nol: belum terbukti'})")
+    if all(checks.values()) and proven:
+        print("  VONIS: LULUS. Lanjut paper forward-test.")
+    elif all(checks.values()):
+        print("  VONIS: MENJANJIKAN tetapi belum terbukti. Boleh paper forward-test, BUKAN uang sungguhan.")
+    else:
+        print("  VONIS: BELUM MEMENUHI tujuan. Jangan dilanjutkan ke uang sungguhan; revisi hipotesis, bukan ambang.")
+
+
+def _btc_move(days: int, offset: int) -> float | None:
+    """Perubahan harga BTC (%) pada jendela [-(offset+days), -offset] hari, dari cache. Konteks rezim saja."""
+    f = DATA_DIR / f"BTCUSDT_15m_{offset + days + 5}d.pkl"
+    if not f.exists():
+        f = DATA_DIR / f"BTCUSDT_15m_{days + 5}d.pkl"
+        if offset or not f.exists():
+            return None
+    b = pd.read_pickle(f)
+    end_ts = int(b["close_time"].iloc[-1]) - offset * 86_400_000
+    a, z = np.searchsorted(b["close_time"].to_numpy(), [end_ts - days * 86_400_000, end_ts])
+    return float((b["close"].iloc[min(z, len(b) - 1)] / b["close"].iloc[a] - 1) * 100)
+
+
+def holdout(days: int = 180) -> None:
+    """Vonis TUNGGAL pada 180 hari sebelum kalibrasi, dengan aturan dibekukan (skor >= FROZEN_THRESHOLD)."""
+    raw = pd.read_csv(CSV_HOLD, parse_dates=["time", "exit_time"])
+    df = dedupe_non_overlapping(raw)
+    n_pairs = df["symbol"].nunique()
+    print(f"HOLD-OUT: {len(raw)} kandidat mentah -> {len(df)} trade (satu-posisi-per-pair), {n_pairs} pair punya kandidat")
+    print(f"aturan dibekukan: skor harga >= {FROZEN_THRESHOLD} (tanpa penyesuaian)")
+    for name, off in (("kalibrasi (0..180 hari lalu)", 0), ("hold-out (180..360 hari lalu)", days)):
+        mv = _btc_move(days, off)
+        print(f"  konteks BTC {name}: {mv:+.1f}%" if mv is not None else f"  konteks BTC {name}: n/a")
+    print("\n== Baseline gerbang, semua kandidat tanpa ambang ==\n ", _m(df))
+    rho = df["score"].corr(df["r"], method="spearman")
+    print(f"== Spearman skor vs R: rho={rho:+.3f} (n={len(df)}; noise < ~{2 / np.sqrt(len(df)):.2f})")
+    sel = df[df["score"] >= FROZEN_THRESHOLD]
+    print(f"== Aturan dibekukan (skor >= {FROZEN_THRESHOLD}) ==\n ", _m(sel))
+    print("   (kalibrasi uji sebelumnya: n=41 win 43.9% avgR +0.245)")
+    verdict(df.iloc[0:0], df, FROZEN_THRESHOLD, n_pairs=n_pairs)
+    print("\nHold-out ini dinilai SEKALI. Bila gagal, jangan menyetel ulang ambang pada data ini.")
 
 
 def main() -> None:
@@ -155,9 +285,19 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sc = sub.add_parser("scan"); sc.add_argument("--days", type=int, default=180)
     sc.add_argument("--pairs", type=int, default=20); sc.add_argument("--workers", type=int, default=4)
+    sc.add_argument("--offset-days", type=int, default=0)
+    so = sub.add_parser("scan-one"); so.add_argument("symbol"); so.add_argument("--days", type=int, default=180); so.add_argument("--offset-days", type=int, default=0)
     sub.add_parser("analyze")
+    sub.add_parser("holdout")
     a = ap.parse_args()
-    run_scan(a.days, a.pairs, a.workers) if a.cmd == "scan" else analyze()
+    if a.cmd == "scan":
+        run_scan(a.days, a.pairs, a.workers, a.offset_days)
+    elif a.cmd == "scan-one":
+        scan_one(a.symbol, a.days, a.offset_days)
+    elif a.cmd == "holdout":
+        holdout()
+    else:
+        analyze()
 
 
 if __name__ == "__main__":

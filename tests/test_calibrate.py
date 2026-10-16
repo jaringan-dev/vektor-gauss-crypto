@@ -40,3 +40,4 @@ def test_analyze_runs_end_to_end_on_synthetic_csv(tmp_path, monkeypatch, capsys)
     calibrate.analyze(min_train=20)
     out = capsys.readouterr().out
     assert "Spearman" in out and "UJI" in out and "ambang terbaik" in out
+    assert "6. VONIS" in out and ("VONIS:" in out or "TIDAK ADA KESIMPULAN" in out)
