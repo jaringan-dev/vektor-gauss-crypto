@@ -31,9 +31,10 @@ class Settings:
     max_signals_per_day: int = 5
 
     # --- Skor & filter sinyal ---
-    score_threshold: float = 60.0           # skor 0-100 dengan data posisi (MCP)
-    score_threshold_degraded: float = 52.0  # skor maks 65 bila MCP tidak tersedia
-    prefilter_score: float = 35.0           # skor harga minimum sebelum MCP dipanggil
+    # Ambang beku kalibrasi 2026-10-16 (harga-only). Jangan diubah untuk hold-out.
+    score_threshold_degraded: float = 37.0  # = FROZEN_THRESHOLD; skor maks 65 tanpa posisi
+    score_threshold: float = 50.0           # dengan posisi: butuh ~13 poin lapisan posisi di atas aturan beku
+    prefilter_score: float = 35.0           # skor harga minimum sebelum MCP/DB dipanggil
     min_sweep_atr: float = 0.3              # sapuan lebih dangkal = noise
     max_sweep_atr: float = 2.5              # sapuan lebih dalam = lebih mirip breakdown
     sl_buffer_atr: float = 0.1

@@ -100,6 +100,32 @@ def test_portfolio_daily_cap_resets_next_day():
     assert len(apply_portfolio_rules(items, Settings(max_signals_per_day=1))) == 2
 
 
+def _tr_r(sym, minute, exit_minute, r, score=60.0, day=1):
+    t0 = pd.Timestamp(f"2026-01-{day:02d}", tz="UTC")
+    return Trade(sym, t0 + pd.Timedelta(minutes=minute), t0 + pd.Timedelta(minutes=exit_minute),
+                 score, "SL" if r < 0 else "TP", r, 1), 0
+
+
+def test_portfolio_daily_loss_limit_stops_new_signals():
+    # Dua loss -1R dulu, lalu sinyal bagus — dengan limit 2R, sinyal ketiga ditolak
+    items = [
+        _tr_r("A", 0, 10, -1.0),
+        _tr_r("B", 15, 25, -1.0),
+        _tr_r("C", 30, 40, 2.0, score=90),
+    ]
+    taken = apply_portfolio_rules(items, Settings(daily_loss_limit_r=2.0, max_signals_per_day=10))
+    assert [t.symbol for t in taken] == ["A", "B"]
+
+
+def test_portfolio_daily_loss_resets_next_day():
+    items = [
+        _tr_r("A", 0, 10, -3.0, day=1),
+        _tr_r("B", 0, 10, 1.0, day=2),
+    ]
+    taken = apply_portfolio_rules(items, Settings(daily_loss_limit_r=3.0, max_signals_per_day=5))
+    assert [t.symbol for t in taken] == ["A", "B"]
+
+
 def test_prefilter_never_drops_a_real_sweep():
     """Pada candle sapuan sintetis, mask harus True pada candle sinyal."""
     rng = np.random.default_rng(3)

@@ -1,4 +1,4 @@
-"""Backtester lapisan harga + CVD (tanpa data posisi MCP: riwayat OI/L-S hanya ~30 hari).
+"""Backtester lapisan harga + CVD; opsional join `positioning.db` (--with-positioning).
 
 Prinsip anti-bias:
 - HTF disejajarkan per waktu: hanya candle 1H/4H yang SUDAH close sebelum sinyal.
@@ -6,6 +6,7 @@ Prinsip anti-bias:
 - Fee taker dua sisi dan slippage dimasukkan ke R.
 - Baseline entry acak dengan geometri risiko serupa, untuk melihat apakah ada edge sama sekali.
 - Pair dipilih dari top volume SEKARANG -> ada survivorship bias (dicatat di laporan).
+- Data posisi dari SQLite memakai `available_ms` (anti-lookahead).
 """
 from __future__ import annotations
 
@@ -22,6 +23,8 @@ import pandas as pd
 
 from .binance_rest import BinanceREST
 from .config import SETTINGS, Settings
+from .positioning_db import make_asof_fetcher
+from .recorder import DB_PATH, connect as connect_db
 from .risk import TradePlan, plan_long
 from .scorer import Signal, evaluate
 from .smc import atr
@@ -68,21 +71,27 @@ def _htf_window(h: pd.DataFrame, h_close: np.ndarray, t: int) -> pd.DataFrame:
 
 
 def scan_symbol(args) -> tuple[str, list[Signal], Counter]:
-    symbol, l, h1, h4, start_i, s, use_prefilter = args
+    symbol, l, h1, h4, start_i, s, use_prefilter, db_path = args
     mask = candidate_mask(l) if use_prefilter else np.ones(len(l), bool)
     h1c, h4c = h1["close_time"].to_numpy(), h4["close_time"].to_numpy()
+    db = connect_db(db_path) if db_path else None
     sigs, why = [], Counter()
-    for i in range(max(start_i, s.scan_window), len(l)):
-        if not mask[i]:
-            continue
-        w = l.iloc[i - s.scan_window + 1 : i + 1].reset_index(drop=True)
-        t = int(w["close_time"].iloc[-1])
-        sig, reason = evaluate(symbol, w, _htf_window(h1, h1c, t), _htf_window(h4, h4c, t), None, s)
-        if sig:
-            sigs.append(_with_index(sig, i))
-            why["SINYAL"] += 1
-        else:
-            why[re.sub(r"[\d.\-]+", "#", reason)] += 1
+    try:
+        for i in range(max(start_i, s.scan_window), len(l)):
+            if not mask[i]:
+                continue
+            w = l.iloc[i - s.scan_window + 1 : i + 1].reset_index(drop=True)
+            t = int(w["close_time"].iloc[-1])
+            fetch = make_asof_fetcher(db, t) if db is not None else None
+            sig, reason = evaluate(symbol, w, _htf_window(h1, h1c, t), _htf_window(h4, h4c, t), fetch, s)
+            if sig:
+                sigs.append(_with_index(sig, i))
+                why["SINYAL"] += 1
+            else:
+                why[re.sub(r"[\d.\-]+", "#", reason)] += 1
+    finally:
+        if db is not None:
+            db.close()
     return symbol, sigs, why
 
 
@@ -137,10 +146,11 @@ def to_trade(sym: str, plan: TradePlan, score: float, l: pd.DataFrame, i: int, s
 
 def apply_portfolio_rules(items: list[tuple[Trade, int]], s: Settings) -> list[Trade]:
     """Urut kronologis (skor tertinggi dulu bila bersamaan); satu posisi per pair;
-    maksimum `max_signals_per_day` per hari UTC. Batas rugi harian belum dimodelkan."""
+    maksimum `max_signals_per_day` per hari UTC; henti bila rugi harian mencapai `daily_loss_limit_r`."""
     items = sorted(items, key=lambda x: (x[0].time, -x[0].score))
     busy: dict[str, pd.Timestamp] = {}
     per_day: Counter = Counter()
+    day_r: dict = {}
     taken: list[Trade] = []
     for tr, _ in items:
         if busy.get(tr.symbol, pd.Timestamp.min.tz_localize("UTC")) > tr.time:
@@ -148,7 +158,10 @@ def apply_portfolio_rules(items: list[tuple[Trade, int]], s: Settings) -> list[T
         day = tr.time.date()
         if per_day[day] >= s.max_signals_per_day:
             continue
+        if day_r.get(day, 0.0) <= -s.daily_loss_limit_r:
+            continue
         per_day[day] += 1
+        day_r[day] = day_r.get(day, 0.0) + tr.r
         busy[tr.symbol] = tr.exit_time
         taken.append(tr)
     return taken
@@ -209,8 +222,14 @@ def main() -> None:
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--no-prefilter", action="store_true", help="evaluasi semua candle (lambat; untuk verifikasi)")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--with-positioning", action="store_true",
+                    help="join data/positioning.db (anti-lookahead) ke skor")
     args = ap.parse_args()
     s = SETTINGS
+
+    db_path = str(DB_PATH) if args.with_positioning else None
+    if args.with_positioning and not DB_PATH.exists():
+        raise SystemExit(f"--with-positioning tetapi DB tidak ada: {DB_PATH}")
 
     rest = BinanceREST()
     symbols = rest.top_symbols(args.pairs, s.min_quote_volume_usd)
@@ -225,9 +244,10 @@ def main() -> None:
             continue
         start_i = int(np.searchsorted(l["close_time"].to_numpy(), l["close_time"].iloc[-1] - args.days * 86_400_000))
         data[sym] = (l, h1, h4, start_i)
-    print(f"{len(data)} pair, {args.days} hari: {', '.join(data)}\n")
+    pos_note = " + positioning.db" if db_path else ""
+    print(f"{len(data)} pair, {args.days} hari{pos_note}: {', '.join(data)}\n")
 
-    jobs = [(sym, l, h1, h4, st, s, not args.no_prefilter) for sym, (l, h1, h4, st) in data.items()]
+    jobs = [(sym, l, h1, h4, st, s, not args.no_prefilter, db_path) for sym, (l, h1, h4, st) in data.items()]
     t0 = time.time()
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
         results = list(ex.map(scan_symbol, jobs))
@@ -270,8 +290,8 @@ def main() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     pd.DataFrame([t.__dict__ for t in taken]).to_csv(DATA_DIR / "backtest_trades.csv", index=False)
     print(f"\ntrade disimpan: {DATA_DIR / 'backtest_trades.csv'}")
-    print("Catatan: pair dipilih dari top volume SEKARANG (survivorship bias); lapisan posisi MCP tidak diuji; "
-          "batas rugi harian belum dimodelkan.")
+    print("Catatan: pair dipilih dari top volume SEKARANG (survivorship bias); "
+          "lapisan posisi historis opsional lewat --with-positioning.")
 
 
 if __name__ == "__main__":

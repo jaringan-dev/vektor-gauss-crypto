@@ -1,14 +1,13 @@
 # vektor-gauss-crypto
 
-Toolkit riset sinyal **long** berbasis Smart Money Concepts (SMC) untuk Binance USDT-M Futures: deteksi sweep + reclaim, skor confluence (harga/CVD + opsional posisi), backtest, kalibrasi ambang skor, dan perekam data posisi (OI / long-short).
-
-> Belum ada CLI scanner live / alert Telegram. Token Telegram di `.env` sudah disiapkan untuk tahap berikutnya.
+Toolkit riset + scanner live sinyal **long** berbasis Smart Money Concepts (SMC) untuk Binance USDT-M Futures: deteksi sweep + reclaim, skor confluence (harga/CVD + posisi), backtest, kalibrasi, perekam posisi, alert Telegram, dan jurnal paper.
 
 ## Prasyarat
 
 - Python **3.12+**
 - Akses jaringan ke `fapi.binance.com` (REST publik, tanpa API key)
 - Opsional: endpoint MCP + token untuk lapisan posisi “bandar vs retail”
+- Opsional: bot Telegram untuk alert
 
 ## Setup
 
@@ -33,23 +32,28 @@ Isi `.env` bila perlu:
 |---|---|---|
 | `MCP_URL` | Tidak | Default `https://binance.jaringan.dev/mcp` |
 | `MCP_AUTH_TOKEN` | Untuk MCP | Bearer token klien MCP |
-| `TELEGRAM_BOT_TOKEN` | Tidak (belum dipakai CLI) | Cadangan alert |
-| `TELEGRAM_CHAT_ID` | Tidak (belum dipakai CLI) | Cadangan alert |
+| `TELEGRAM_BOT_TOKEN` | Untuk alert | Dipakai `smcbot.live` |
+| `TELEGRAM_CHAT_ID` | Untuk alert | Dipakai `smcbot.live` |
 
-Folder `data/` dibuat otomatis (cache klines `.pkl`, CSV hasil, SQLite recorder). Folder ini di-ignore git.
+Folder `data/` dibuat otomatis (cache klines `.pkl`, CSV hasil, SQLite recorder, jurnal paper). Folder ini di-ignore git.
 
 ## Konfigurasi
 
-Semua parameter tuning ada di `smcbot/config.py` (`SETTINGS`): universe pair, risiko akun, ambang skor, fee/slippage backtest, timeframe LTF/HTF (`15m` / `1h`+`4h`).
+Semua parameter tuning ada di `smcbot/config.py` (`SETTINGS`):
 
-Skor maksimum 100:
+| Kunci | Default | Arti |
+|---|---|---|
+| `score_threshold_degraded` | **37** | Ambang beku kalibrasi (harga-only / tanpa posisi) |
+| `score_threshold` | **50** | Ambang bila data posisi tersedia (~13 poin lapisan posisi) |
+| `prefilter_score` | 35 | Skor harga minimum sebelum MCP/DB dipanggil |
+| `daily_loss_limit_r` | 3.0 | Henti sinyal baru hari itu setelah rugi kumulatif (backtest + live cap harian) |
+| `max_signals_per_day` | 5 | Cap frekuensi |
 
-- **65** dari harga + flow (sweep, zona FVG/OB, CVD) — cukup untuk backtest/kalibrasi tanpa MCP
-- **+35** dari posisi (funding, retail, top trader, OI) lewat MCP — bila MCP gagal, mode *degraded* memakai ambang lebih rendah
+Skor maksimum 100: **65** harga+flow + **35** posisi (MCP atau `positioning.db`).
 
 ## Cara menjalankan
 
-Jalankan semua perintah dari root repo, dengan venv aktif.
+Jalankan dari root repo, venv aktif.
 
 ### Tes unit
 
@@ -57,91 +61,88 @@ Jalankan semua perintah dari root repo, dengan venv aktif.
 pytest -q
 ```
 
-### Backtest (lapisan harga + CVD)
+### Scanner live + Telegram + jurnal paper
 
-Memakai top pair by volume saat ini, cache klines ke `data/*.pkl`, menulis trade terpilih ke `data/backtest_trades.csv`.
+```bash
+python -m smcbot.live once                 # satu putaran top pair
+python -m smcbot.live run                  # loop tiap close 15m
+python -m smcbot.live once --no-mcp        # harga saja (degraded)
+python -m smcbot.live once --no-telegram
+python -m smcbot.live once --no-paper
+```
+
+Live memakai MCP bila tersedia, fallback ke `data/positioning.db`. Sinyal masuk `data/paper_journal.csv` dan dikirim ke Telegram bila `.env` terisi.
+
+Windows Task Scheduler: `scripts/run_live.cmd` (sesuaikan path Python).
+
+### Jurnal paper forward-test
+
+```bash
+python -m smcbot.paper status
+python -m smcbot.paper settle     # tutup baris OPEN dari klines terkini
+python -m smcbot.paper summary
+```
+
+Sebelum paper dengan uang perhatian: konfirmasi vonis hold-out (`python -m smcbot.calibrate holdout`). Vonis LULUS/MENJANJIKAN → paper saja; gagal → revisi hipotesis, bukan utak-atik ambang di hold-out.
+
+### Backtest (harga + CVD, opsional posisi)
 
 ```bash
 python -m smcbot.backtest
 python -m smcbot.backtest --days 180 --pairs 20 --workers 4
-python -m smcbot.backtest --refresh          # unduh ulang klines
-python -m smcbot.backtest --no-prefilter     # evaluasi semua candle (lambat)
+python -m smcbot.backtest --with-positioning   # join data/positioning.db (anti-lookahead)
+python -m smcbot.backtest --refresh
+python -m smcbot.backtest --no-prefilter
 ```
 
-| Flag | Default | Arti |
-|---|---|---|
-| `--days` | `180` | Periode uji (hari) |
-| `--pairs` | `20` | Jumlah pair top volume |
-| `--workers` | `4` | Proses paralel |
-| `--refresh` | off | Abaikan cache `.pkl` |
-| `--no-prefilter` | off | Tanpa mask kandidat sweep |
+Trade terpilih → `data/backtest_trades.csv`. Aturan portofolio: satu posisi/pair, cap harian, **batas rugi harian** (`daily_loss_limit_r`).
 
-**Catatan bias:** pair diambil dari ranking volume *sekarang* (survivorship); lapisan posisi MCP tidak diuji; daily loss limit belum dimodelkan.
+**Catatan bias:** pair dari ranking volume *sekarang* (survivorship).
 
 ### Kalibrasi skor
 
-Alur: scan kandidat → analisis split waktu → (opsional) hold-out sekali.
-
 ```bash
-# 1) Scan (lambat) → data/candidates.csv
 python -m smcbot.calibrate scan --days 180 --pairs 20 --workers 4
-
-# 2) Analisis cepat (bisa diulang)
 python -m smcbot.calibrate analyze
-
-# 3) Hold-out: periode SEBELUM jendela kalibrasi
 python -m smcbot.calibrate scan --days 180 --pairs 20 --offset-days 180
 python -m smcbot.calibrate holdout
-```
-
-Satu simbol saja:
-
-```bash
 python -m smcbot.calibrate scan-one BTCUSDT --days 180
 ```
 
-Ambang beku hold-out ada di `FROZEN_THRESHOLD` dalam `smcbot/calibrate.py` — jangan disetel ulang terhadap data hold-out.
+`FROZEN_THRESHOLD` = `SETTINGS.score_threshold_degraded` (37). Jangan disetel ulang terhadap data hold-out.
 
 ### Perekam posisi (SQLite)
 
-Binance hanya menyimpan ~30 hari riwayat OI / rasio L-S / taker. Recorder menimbun snapshot 15m ke `data/positioning.db`.
-
 ```bash
-# Sekali di awal: isi ~29 hari ke belakang
 python -m smcbot.recorder backfill --days 29
-
-# Satu siklus
 python -m smcbot.recorder once
-
-# Loop tiap batas 15 menit (untuk Task Scheduler / service)
 python -m smcbot.recorder run
-
-# Ringkasan isi DB + celah
 python -m smcbot.recorder status
 ```
 
-Di Windows, `scripts/run_recorder.cmd` memanggil `python -m smcbot.recorder run` dan menulis stdout ke `data/recorder_stdout.log`. Sesuaikan path Python di file itu bila beda mesin.
-
-Siklus yang terlewat (PC mati/tidur) diisi ulang lewat UPSERT selama jeda masih dalam jangkauan backfill/limit API.
+Windows: `scripts/run_recorder.cmd`. DB → `data/positioning.db` (dipakai live fallback + `--with-positioning`).
 
 ## Struktur modul
 
 ```
 smcbot/
-  config.py        # SETTINGS + env
-  binance_rest.py  # REST publik futures
-  mcp_client.py    # JSON-RPC MCP (posisi)
-  smc.py           # ATR, swing, sweep, FVG/OB, bias HTF
-  flow.py          # delta / CVD / absorption
-  positioning.py   # fetch skor posisi lewat MCP
-  risk.py          # rencana long (entry, SL, TP, size)
-  scorer.py        # gerbang + skor + evaluate()
-  backtest.py      # CLI backtest
-  calibrate.py     # CLI kalibrasi / hold-out
-  recorder.py      # CLI perekam posisi
+  config.py           # SETTINGS + env
+  binance_rest.py     # REST publik futures
+  mcp_client.py       # JSON-RPC MCP (posisi)
+  smc.py / flow.py    # detektor + CVD
+  positioning.py      # fetch MCP → Positioning
+  positioning_db.py   # baca SQLite + available_ms
+  risk.py / scorer.py # rencana + evaluate()
+  backtest.py         # CLI backtest
+  calibrate.py        # CLI kalibrasi / hold-out
+  recorder.py         # CLI perekam posisi
+  live.py             # CLI scanner live
+  telegram_notify.py  # alert Telegram
+  paper.py            # jurnal paper forward-test
 scripts/
-  run_recorder.cmd # peluncur Windows untuk recorder loop
-tests/             # pytest
+  run_recorder.cmd
+  run_live.cmd
+tests/
 ```
 
 ## Dependensi

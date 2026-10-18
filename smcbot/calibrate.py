@@ -24,8 +24,8 @@ from .scorer import gather_candidate
 CSV = DATA_DIR / "candidates.csv"
 CSV_HOLD = DATA_DIR / "candidates_holdout.csv"
 
-#: ATURAN DIBEKUKAN dari kalibrasi 2026-10-16 (dipilih dari data latih saja). Jangan diubah untuk hold-out.
-FROZEN_THRESHOLD = 37.0
+#: Sumber tunggal: SETTINGS.score_threshold_degraded (kalibrasi 2026-10-16). Jangan diubah untuk hold-out.
+FROZEN_THRESHOLD = SETTINGS.score_threshold_degraded
 
 
 # --------------------------------------------------------------------------
